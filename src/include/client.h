@@ -13,7 +13,6 @@ extern int columns;
 extern int total_mines;
 
 char client_map[35][35];
-// Mine probability for guessing
 double mine_prob[35][35];
 
 int remaining_mines_g;
@@ -31,13 +30,11 @@ void Execute(int r, int c, int type);
 void InitGame() {
   remaining_mines_g = total_mines;
   total_unknown_g = rows * columns;
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
       client_map[i][j] = '?';
       mine_prob[i][j] = 0.5;
     }
-  }
-  
   int first_row, first_column;
   std::cin >> first_row >> first_column;
   Execute(first_row, first_column, 0);
@@ -47,23 +44,19 @@ void ReadMap() {
   for (int i = 0; i < rows; i++) {
     std::string line;
     std::cin >> line;
-    for (int j = 0; j < columns; j++) {
+    for (int j = 0; j < columns; j++)
       client_map[i][j] = line[j];
-    }
   }
 }
 
 struct NeighborInfo {
-  int unknown_count;
-  int marked_count;
-  int number;
+  int unknown_count, marked_count, number;
   std::vector<std::pair<int,int>> unknowns;
 };
 
 NeighborInfo GetNeighborInfo(int r, int c) {
   NeighborInfo info;
-  info.unknown_count = 0;
-  info.marked_count = 0;
+  info.unknown_count = info.marked_count = 0;
   info.number = client_map[r][c] - '0';
   for (int d = 0; d < 8; d++) {
     int nr = r + cdx[d], nc = c + cdy[d];
@@ -71,19 +64,143 @@ NeighborInfo GetNeighborInfo(int r, int c) {
       if (client_map[nr][nc] == '?') {
         info.unknown_count++;
         info.unknowns.push_back({nr, nc});
-      } else if (client_map[nr][nc] == '@') {
+      } else if (client_map[nr][nc] == '@')
         info.marked_count++;
-      }
     }
   }
   return info;
 }
 
-// Definite deduction: find cells that MUST be mines or MUST be safe
+// Constraint: a set of variable indices must sum to mine_count
+struct CConstraint {
+  std::vector<int> vars; // sorted
+  int mine_count;
+};
+
+// Backtracking solver for a connected component
+// Returns true if any definite conclusions found
+// Also fills in probabilities for probabilistic guessing
+struct ComponentSolver {
+  int n;
+  std::vector<std::pair<int,int>> cells; // the cells in this component
+  std::vector<CConstraint> constraints;
+  // For each variable, which constraints involve it
+  std::vector<std::vector<int>> var_constraints;
+  
+  // assignment: -1 = unset, 0 = safe, 1 = mine
+  std::vector<int> assignment;
+  // Count of valid assignments where cell k is a mine
+  std::vector<long long> mine_count_sum;
+  long long total_valid;
+  
+  // Definite results
+  std::vector<int> definite_safe, definite_mine;
+  
+  bool timed_out;
+  long long enum_count;
+  static const long long MAX_ENUM = 5000000LL;
+  
+  void Init(int size) {
+    n = size;
+    var_constraints.resize(n);
+    assignment.assign(n, -1);
+    mine_count_sum.assign(n, 0);
+    total_valid = 0;
+    timed_out = false;
+    enum_count = 0;
+  }
+  
+  void AddConstraint(const CConstraint& c) {
+    int idx = constraints.size();
+    constraints.push_back(c);
+    for (int v : c.vars)
+      var_constraints[v].push_back(idx);
+  }
+  
+  // Check if current partial assignment is consistent
+  bool IsConsistent() {
+    for (auto& c : constraints) {
+      int assigned_mines = 0, unassigned = 0;
+      for (int v : c.vars) {
+        if (assignment[v] == -1) unassigned++;
+        else if (assignment[v] == 1) assigned_mines++;
+      }
+      // Too many mines already
+      if (assigned_mines > c.mine_count) return false;
+      // Not enough unassigned to reach mine_count
+      if (assigned_mines + unassigned < c.mine_count) return false;
+    }
+    return true;
+  }
+  
+  // Check consistency only for constraints involving variable v
+  bool IsConsistentFor(int v) {
+    for (int ci : var_constraints[v]) {
+      auto& c = constraints[ci];
+      int assigned_mines = 0, unassigned = 0;
+      for (int var : c.vars) {
+        if (assignment[var] == -1) unassigned++;
+        else if (assignment[var] == 1) assigned_mines++;
+      }
+      if (assigned_mines > c.mine_count) return false;
+      if (assigned_mines + unassigned < c.mine_count) return false;
+    }
+    return true;
+  }
+  
+  void Backtrack(int idx) {
+    if (timed_out) return;
+    if (++enum_count > MAX_ENUM) {
+      timed_out = true;
+      return;
+    }
+    
+    if (idx == n) {
+      // All assigned - check all constraints satisfied exactly
+      for (auto& c : constraints) {
+        int mines = 0;
+        for (int v : c.vars)
+          if (assignment[v] == 1) mines++;
+        if (mines != c.mine_count) return;
+      }
+      total_valid++;
+      for (int k = 0; k < n; k++)
+        if (assignment[k] == 1) mine_count_sum[k]++;
+      return;
+    }
+    
+    // Try safe (0)
+    assignment[idx] = 0;
+    if (IsConsistentFor(idx))
+      Backtrack(idx + 1);
+    if (timed_out) return;
+    
+    // Try mine (1)
+    assignment[idx] = 1;
+    if (IsConsistentFor(idx))
+      Backtrack(idx + 1);
+    
+    assignment[idx] = -1;
+  }
+  
+  void Solve() {
+    Backtrack(0);
+    
+    if (!timed_out && total_valid > 0) {
+      for (int k = 0; k < n; k++) {
+        if (mine_count_sum[k] == 0)
+          definite_safe.push_back(k);
+        else if (mine_count_sum[k] == total_valid)
+          definite_mine.push_back(k);
+      }
+    }
+  }
+};
+
 bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std::pair<int,int>>& mine_cells) {
   bool found = false;
   
-  // Basic: check each numbered cell
+  // Basic constraint checking
   for (int i = 0; i < rows; i++) {
     for (int j = 0; j < columns; j++) {
       if (client_map[i][j] >= '1' && client_map[i][j] <= '8') {
@@ -102,7 +219,7 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   }
   if (found) return true;
   
-  // Global constraint
+  // Global constraints
   if (remaining_mines_g == 0) {
     for (int i = 0; i < rows; i++)
       for (int j = 0; j < columns; j++)
@@ -117,11 +234,11 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   }
   
   // Subset reasoning
-  struct Constraint {
+  struct SimpleConstraint {
     std::vector<std::pair<int,int>> cells;
     int mine_count;
   };
-  std::vector<Constraint> constraints;
+  std::vector<SimpleConstraint> constraints;
   
   for (int i = 0; i < rows; i++) {
     for (int j = 0; j < columns; j++) {
@@ -129,8 +246,7 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
         NeighborInfo info = GetNeighborInfo(i, j);
         if (info.unknown_count == 0) continue;
         int remaining = info.number - info.marked_count;
-        if (remaining < 0 || remaining > info.unknown_count) continue;
-        Constraint c;
+        SimpleConstraint c;
         c.cells = info.unknowns;
         std::sort(c.cells.begin(), c.cells.end());
         c.mine_count = remaining;
@@ -140,15 +256,12 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   }
   
   // Deduplicate
-  auto cmp = [](const Constraint& a, const Constraint& b) {
-    if (a.cells != b.cells) return a.cells < b.cells;
-    return a.mine_count < b.mine_count;
-  };
-  std::sort(constraints.begin(), constraints.end(), cmp);
-  constraints.erase(std::unique(constraints.begin(), constraints.end(),
-    [](const Constraint& a, const Constraint& b) {
-      return a.cells == b.cells;
-    }), constraints.end());
+  std::sort(constraints.begin(), constraints.end(), [](const SimpleConstraint& a, const SimpleConstraint& b) {
+    return a.cells < b.cells || (a.cells == b.cells && a.mine_count < b.mine_count);
+  });
+  constraints.erase(std::unique(constraints.begin(), constraints.end(), [](const SimpleConstraint& a, const SimpleConstraint& b) {
+    return a.cells == b.cells;
+  }), constraints.end());
   
   for (int i = 0; i < (int)constraints.size(); i++) {
     for (int j = 0; j < (int)constraints.size(); j++) {
@@ -173,15 +286,14 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   }
   if (found) return true;
   
-  // Enumeration on connected components
-  // Build frontier
+  // Backtracking solver on connected components
   bool is_frontier[35][35];
   int frontier_id[35][35];
   memset(is_frontier, 0, sizeof(is_frontier));
   memset(frontier_id, -1, sizeof(frontier_id));
   std::vector<std::pair<int,int>> frontier;
   
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
       if (client_map[i][j] != '?') continue;
       for (int d = 0; d < 8; d++) {
@@ -192,7 +304,6 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
         }
       }
     }
-  }
   
   for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++)
@@ -204,9 +315,9 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   int n_vars = frontier.size();
   if (n_vars == 0) return false;
   
-  // Build adjacency for connected components
+  // Build adjacency
   std::vector<std::vector<int>> adj(n_vars);
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
       if (client_map[i][j] < '1' || client_map[i][j] > '8') continue;
       NeighborInfo info = GetNeighborInfo(i, j);
@@ -221,91 +332,70 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
           adj[ids[b]].push_back(ids[a]);
         }
     }
-  }
   
+  // Find connected components
   std::vector<int> group(n_vars, -1);
-  int n_groups = 0;
   std::vector<std::vector<int>> groups;
+  int n_groups = 0;
   
   for (int i = 0; i < n_vars; i++) {
     if (group[i] != -1) continue;
     std::vector<int> queue = {i};
     group[i] = n_groups;
-    for (int qi = 0; qi < (int)queue.size(); qi++) {
-      for (int nb : adj[queue[qi]]) {
+    for (int qi = 0; qi < (int)queue.size(); qi++)
+      for (int nb : adj[queue[qi]])
         if (group[nb] == -1) {
           group[nb] = n_groups;
           queue.push_back(nb);
         }
-      }
-    }
     groups.push_back(queue);
     n_groups++;
   }
   
   for (int g = 0; g < n_groups; g++) {
-    int comp_size = groups[g].size();
-    if (comp_size > 25) continue;
+    auto& comp = groups[g];
+    int comp_size = comp.size();
+    if (comp_size > 40) continue; // skip very large components
     
-    auto& comp_vars = groups[g];
+    ComponentSolver solver;
+    solver.Init(comp_size);
+    solver.cells.resize(comp_size);
     
-    // Get constraints
-    struct LocalConstraint {
-      int mask; // bitmask of variables in this constraint
-      int mine_count;
-    };
-    std::vector<LocalConstraint> local_constraints;
-    
-    // Map from global frontier id to local index
     int local_id[900];
     memset(local_id, -1, sizeof(local_id));
-    for (int k = 0; k < comp_size; k++)
-      local_id[comp_vars[k]] = k;
+    for (int k = 0; k < comp_size; k++) {
+      local_id[comp[k]] = k;
+      solver.cells[k] = frontier[comp[k]];
+    }
     
-    for (int i = 0; i < rows; i++) {
+    for (int i = 0; i < rows; i++)
       for (int j = 0; j < columns; j++) {
         if (client_map[i][j] < '1' || client_map[i][j] > '8') continue;
         NeighborInfo info = GetNeighborInfo(i, j);
         if (info.unknown_count == 0) continue;
         
-        int mask = 0;
+        CConstraint cc;
         bool all_in = true;
         for (auto& p : info.unknowns) {
           int id = frontier_id[p.first][p.second];
           if (id < 0 || group[id] != g) { all_in = false; break; }
-          mask |= (1 << local_id[id]);
+          cc.vars.push_back(local_id[id]);
         }
-        if (!all_in) continue;
-        if (mask == 0) continue;
-        
-        LocalConstraint lc;
-        lc.mask = mask;
-        lc.mine_count = info.number - info.marked_count;
-        local_constraints.push_back(lc);
+        if (!all_in || cc.vars.empty()) continue;
+        std::sort(cc.vars.begin(), cc.vars.end());
+        cc.mine_count = info.number - info.marked_count;
+        solver.AddConstraint(cc);
       }
-    }
     
-    std::vector<int> can_be_0(comp_size, 0), can_be_1(comp_size, 0);
+    solver.Solve();
     
-    for (int mask = 0; mask < (1 << comp_size); mask++) {
-      bool valid = true;
-      for (auto& lc : local_constraints) {
-        if (__builtin_popcount(mask & lc.mask) != lc.mine_count) { valid = false; break; }
-      }
-      if (valid) {
-        for (int k = 0; k < comp_size; k++) {
-          if (mask & (1 << k)) can_be_1[k]++;
-          else can_be_0[k]++;
-        }
-      }
-    }
-    
-    for (int k = 0; k < comp_size; k++) {
-      if (can_be_0[k] > 0 && can_be_1[k] == 0) {
-        safe_cells.push_back(frontier[comp_vars[k]]);
+    if (!solver.timed_out) {
+      for (int k : solver.definite_safe) {
+        safe_cells.push_back(solver.cells[k]);
         found = true;
-      } else if (can_be_1[k] > 0 && can_be_0[k] == 0) {
-        mine_cells.push_back(frontier[comp_vars[k]]);
+      }
+      for (int k : solver.definite_mine) {
+        mine_cells.push_back(solver.cells[k]);
         found = true;
       }
     }
@@ -314,17 +404,17 @@ bool DeduceDefinite(std::vector<std::pair<int,int>>& safe_cells, std::vector<std
   return found;
 }
 
-// Compute mine probabilities for all unknown cells using enumeration
 void ComputeProbabilities() {
+  // Build frontier and components (same as above)
   bool is_frontier[35][35];
-  int frontier_id_local[35][35];
+  int frontier_id[35][35];
   memset(is_frontier, 0, sizeof(is_frontier));
-  memset(frontier_id_local, -1, sizeof(frontier_id_local));
+  memset(frontier_id, -1, sizeof(frontier_id));
   std::vector<std::pair<int,int>> frontier;
   
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
-      mine_prob[i][j] = -1; // unset
+      mine_prob[i][j] = -1;
       if (client_map[i][j] != '?') continue;
       for (int d = 0; d < 8; d++) {
         int ni = i + cdx[d], nj = j + cdy[d];
@@ -334,26 +424,40 @@ void ComputeProbabilities() {
         }
       }
     }
-  }
   
   for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++)
       if (is_frontier[i][j]) {
-        frontier_id_local[i][j] = frontier.size();
+        frontier_id[i][j] = frontier.size();
         frontier.push_back({i, j});
       }
   
   int n_vars = frontier.size();
+  int non_frontier_count = 0;
+  for (int i = 0; i < rows; i++)
+    for (int j = 0; j < columns; j++)
+      if (client_map[i][j] == '?' && !is_frontier[i][j])
+        non_frontier_count++;
   
-  // Build components
+  if (n_vars == 0) {
+    // All unknowns are non-frontier
+    double p = (total_unknown_g > 0) ? (double)remaining_mines_g / total_unknown_g : 0;
+    for (int i = 0; i < rows; i++)
+      for (int j = 0; j < columns; j++)
+        if (client_map[i][j] == '?')
+          mine_prob[i][j] = p;
+    return;
+  }
+  
+  // Build adjacency and components
   std::vector<std::vector<int>> adj(n_vars);
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
       if (client_map[i][j] < '1' || client_map[i][j] > '8') continue;
       NeighborInfo info = GetNeighborInfo(i, j);
       std::vector<int> ids;
       for (auto& p : info.unknowns) {
-        int id = frontier_id_local[p.first][p.second];
+        int id = frontier_id[p.first][p.second];
         if (id >= 0) ids.push_back(id);
       }
       for (int a = 0; a < (int)ids.size(); a++)
@@ -362,158 +466,107 @@ void ComputeProbabilities() {
           adj[ids[b]].push_back(ids[a]);
         }
     }
-  }
   
   std::vector<int> group(n_vars, -1);
-  int n_groups = 0;
   std::vector<std::vector<int>> groups;
+  int n_groups = 0;
   
   for (int i = 0; i < n_vars; i++) {
     if (group[i] != -1) continue;
     std::vector<int> queue = {i};
     group[i] = n_groups;
-    for (int qi = 0; qi < (int)queue.size(); qi++) {
-      for (int nb : adj[queue[qi]]) {
+    for (int qi = 0; qi < (int)queue.size(); qi++)
+      for (int nb : adj[queue[qi]])
         if (group[nb] == -1) {
           group[nb] = n_groups;
           queue.push_back(nb);
         }
-      }
-    }
     groups.push_back(queue);
     n_groups++;
   }
   
-  int non_frontier_unknown = 0;
+  double estimated_frontier_mines = 0;
+  int computed_vars = 0;
+  
+  for (int g = 0; g < n_groups; g++) {
+    auto& comp = groups[g];
+    int comp_size = comp.size();
+    
+    if (comp_size <= 40) {
+      ComponentSolver solver;
+      solver.Init(comp_size);
+      solver.cells.resize(comp_size);
+      
+      int local_id[900];
+      memset(local_id, -1, sizeof(local_id));
+      for (int k = 0; k < comp_size; k++) {
+        local_id[comp[k]] = k;
+        solver.cells[k] = frontier[comp[k]];
+      }
+      
+      for (int i = 0; i < rows; i++)
+        for (int j = 0; j < columns; j++) {
+          if (client_map[i][j] < '1' || client_map[i][j] > '8') continue;
+          NeighborInfo info = GetNeighborInfo(i, j);
+          if (info.unknown_count == 0) continue;
+          CConstraint cc;
+          bool all_in = true;
+          for (auto& p : info.unknowns) {
+            int id = frontier_id[p.first][p.second];
+            if (id < 0 || group[id] != g) { all_in = false; break; }
+            cc.vars.push_back(local_id[id]);
+          }
+          if (!all_in || cc.vars.empty()) continue;
+          std::sort(cc.vars.begin(), cc.vars.end());
+          cc.mine_count = info.number - info.marked_count;
+          solver.AddConstraint(cc);
+        }
+      
+      solver.Solve();
+      
+      if (!solver.timed_out && solver.total_valid > 0) {
+        for (int k = 0; k < comp_size; k++) {
+          auto [r, c] = solver.cells[k];
+          mine_prob[r][c] = (double)solver.mine_count_sum[k] / solver.total_valid;
+          estimated_frontier_mines += mine_prob[r][c];
+          computed_vars++;
+        }
+        continue;
+      }
+    }
+    
+    // Fallback: heuristic for large components
+    for (int k : comp) {
+      auto [r, c] = frontier[k];
+      double sum_p = 0;
+      int cnt = 0;
+      for (int d = 0; d < 8; d++) {
+        int ni = r + cdx[d], nc = c + cdy[d];
+        if (CInBounds(ni, nc) && client_map[ni][nc] >= '1' && client_map[ni][nc] <= '8') {
+          NeighborInfo info = GetNeighborInfo(ni, nc);
+          if (info.unknown_count > 0) {
+            sum_p += (double)(info.number - info.marked_count) / info.unknown_count;
+            cnt++;
+          }
+        }
+      }
+      mine_prob[r][c] = (cnt > 0) ? sum_p / cnt : (double)remaining_mines_g / total_unknown_g;
+      estimated_frontier_mines += mine_prob[r][c];
+      computed_vars++;
+    }
+  }
+  
+  // Non-frontier probability
+  double non_frontier_mines = std::max(0.0, remaining_mines_g - estimated_frontier_mines);
+  double nf_prob = (non_frontier_count > 0) ? non_frontier_mines / non_frontier_count : 0;
+  nf_prob = std::max(0.0, std::min(1.0, nf_prob));
+  
   for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++)
       if (client_map[i][j] == '?' && !is_frontier[i][j])
-        non_frontier_unknown++;
+        mine_prob[i][j] = nf_prob;
   
-  // For each component, compute probabilities via enumeration
-  int frontier_mines_known = 0; // mines that must be in frontier (from components we can't enumerate)
-  bool computed[900];
-  memset(computed, 0, sizeof(computed));
-  
-  for (int g = 0; g < n_groups; g++) {
-    int comp_size = groups[g].size();
-    if (comp_size > 25) {
-      // Can't enumerate - use heuristic
-      // Average probability from adjacent constraints
-      for (int k : groups[g]) {
-        auto [r, c] = frontier[k];
-        double sum_prob = 0;
-        int count = 0;
-        for (int d = 0; d < 8; d++) {
-          int ni = r + cdx[d], nc = c + cdy[d];
-          if (CInBounds(ni, nc) && client_map[ni][nc] >= '1' && client_map[ni][nc] <= '8') {
-            NeighborInfo info = GetNeighborInfo(ni, nc);
-            if (info.unknown_count > 0) {
-              double p = (double)(info.number - info.marked_count) / info.unknown_count;
-              sum_prob += p;
-              count++;
-            }
-          }
-        }
-        if (count > 0)
-          mine_prob[r][c] = sum_prob / count;
-        else
-          mine_prob[r][c] = (double)remaining_mines_g / total_unknown_g;
-      }
-      continue;
-    }
-    
-    auto& comp_vars = groups[g];
-    
-    struct LocalConstraint {
-      int mask;
-      int mine_count;
-    };
-    std::vector<LocalConstraint> local_constraints;
-    
-    int local_id[900];
-    memset(local_id, -1, sizeof(local_id));
-    for (int k = 0; k < comp_size; k++)
-      local_id[comp_vars[k]] = k;
-    
-    for (int i = 0; i < rows; i++) {
-      for (int j = 0; j < columns; j++) {
-        if (client_map[i][j] < '1' || client_map[i][j] > '8') continue;
-        NeighborInfo info = GetNeighborInfo(i, j);
-        if (info.unknown_count == 0) continue;
-        
-        int mask = 0;
-        bool all_in = true;
-        for (auto& p : info.unknowns) {
-          int id = frontier_id_local[p.first][p.second];
-          if (id < 0 || group[id] != g) { all_in = false; break; }
-          mask |= (1 << local_id[id]);
-        }
-        if (!all_in) continue;
-        if (mask == 0) continue;
-        
-        LocalConstraint lc;
-        lc.mask = mask;
-        lc.mine_count = info.number - info.marked_count;
-        local_constraints.push_back(lc);
-      }
-    }
-    
-    long long total_valid = 0;
-    std::vector<long long> mine_count_per_var(comp_size, 0);
-    
-    for (int mask = 0; mask < (1 << comp_size); mask++) {
-      bool valid = true;
-      for (auto& lc : local_constraints) {
-        if (__builtin_popcount(mask & lc.mask) != lc.mine_count) { valid = false; break; }
-      }
-      if (valid) {
-        // Also check: number of mines in this component <= remaining_mines_g
-        int mines_here = __builtin_popcount(mask);
-        // We don't strictly enforce global constraint per component but it's a filter
-        total_valid++;
-        for (int k = 0; k < comp_size; k++) {
-          if (mask & (1 << k)) mine_count_per_var[k]++;
-        }
-      }
-    }
-    
-    if (total_valid > 0) {
-      for (int k = 0; k < comp_size; k++) {
-        auto [r, c] = frontier[comp_vars[k]];
-        mine_prob[r][c] = (double)mine_count_per_var[k] / total_valid;
-        computed[comp_vars[k]] = true;
-      }
-    }
-  }
-  
-  // Non-frontier unknowns: global probability
-  // Estimate frontier mines from computed probabilities
-  double expected_frontier_mines = 0;
-  int frontier_computed = 0;
-  for (int k = 0; k < n_vars; k++) {
-    if (computed[k]) {
-      auto [r, c] = frontier[k];
-      expected_frontier_mines += mine_prob[r][c];
-      frontier_computed++;
-    }
-  }
-  
-  double non_frontier_mine_estimate = remaining_mines_g - expected_frontier_mines;
-  // Subtract uncomputed frontier cells' estimated contribution
-  int uncomputed_frontier = n_vars - frontier_computed;
-  
-  // For uncomputed frontier cells, we already set their probability above
-  // For non-frontier cells:
-  if (non_frontier_unknown > 0) {
-    double p = std::max(0.0, std::min(1.0, non_frontier_mine_estimate / (non_frontier_unknown + uncomputed_frontier)));
-    for (int i = 0; i < rows; i++)
-      for (int j = 0; j < columns; j++)
-        if (client_map[i][j] == '?' && !is_frontier[i][j])
-          mine_prob[i][j] = p;
-  }
-  
-  // Set default for any unset
+  // Set any remaining unset
   for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++)
       if (client_map[i][j] == '?' && mine_prob[i][j] < 0)
@@ -521,21 +574,17 @@ void ComputeProbabilities() {
 }
 
 void Decide() {
-  // Update counts
   remaining_mines_g = total_mines;
   total_unknown_g = 0;
-  for (int i = 0; i < rows; i++) {
+  for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++) {
       if (client_map[i][j] == '@') remaining_mines_g--;
       if (client_map[i][j] == '?') total_unknown_g++;
     }
-  }
   
-  // Try definite deductions
   std::vector<std::pair<int,int>> safe_cells, mine_cells;
   DeduceDefinite(safe_cells, mine_cells);
   
-  // Deduplicate
   auto dedup = [](std::vector<std::pair<int,int>>& v) {
     std::sort(v.begin(), v.end());
     v.erase(std::unique(v.begin(), v.end()), v.end());
@@ -543,15 +592,14 @@ void Decide() {
   dedup(safe_cells);
   dedup(mine_cells);
   
-  // Priority: mark mines first (enables auto-explore), then safe cells
   if (!mine_cells.empty()) {
     Execute(mine_cells[0].first, mine_cells[0].second, 1);
     return;
   }
   
-  // Check auto-explore opportunities
-  for (int i = 0; i < rows; i++) {
-    for (int j = 0; j < columns; j++) {
+  // Auto-explore
+  for (int i = 0; i < rows; i++)
+    for (int j = 0; j < columns; j++)
       if (client_map[i][j] >= '1' && client_map[i][j] <= '8') {
         NeighborInfo info = GetNeighborInfo(i, j);
         if (info.marked_count == info.number && info.unknown_count > 0) {
@@ -559,37 +607,31 @@ void Decide() {
           return;
         }
       }
-    }
-  }
   
   if (!safe_cells.empty()) {
     Execute(safe_cells[0].first, safe_cells[0].second, 0);
     return;
   }
   
-  // No definite move - compute probabilities and guess
+  // Guess
   ComputeProbabilities();
   
   double best_prob = 2.0;
   int best_r = -1, best_c = -1;
   
-  for (int i = 0; i < rows; i++) {
-    for (int j = 0; j < columns; j++) {
-      if (client_map[i][j] != '?') continue;
-      if (mine_prob[i][j] < best_prob) {
+  for (int i = 0; i < rows; i++)
+    for (int j = 0; j < columns; j++)
+      if (client_map[i][j] == '?' && mine_prob[i][j] < best_prob) {
         best_prob = mine_prob[i][j];
         best_r = i;
         best_c = j;
       }
-    }
-  }
   
   if (best_r >= 0) {
     Execute(best_r, best_c, 0);
     return;
   }
   
-  // Fallback
   for (int i = 0; i < rows; i++)
     for (int j = 0; j < columns; j++)
       if (client_map[i][j] == '?') {
